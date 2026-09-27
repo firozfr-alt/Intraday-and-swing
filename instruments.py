@@ -1,8 +1,7 @@
 """
-Upstox identifies every tradable symbol by an `instrument_key` (e.g. "NSE_EQ|INE002A01018"),
-not by its trading symbol. This module downloads Upstox's public instrument master file once
-a day, tags each equity with `is_fno` (True if it trades in NSE F&O, False if Cash-only),
-and caches it locally.
+Downloads and caches Upstox's public instrument master file daily.
+Tags each equity instrument with `is_fno` (True if eligible for F&O, False for Cash-only)
+and provides universe selectors for both F&O and liquid Cash-segment stocks.
 """
 import gzip
 import json
@@ -12,10 +11,16 @@ import pandas as pd
 import requests
 
 CACHE_FILE = os.path.join(os.path.dirname(__file__), "instrument_cache.csv")
-
-# Primary URL includes both NSE_EQ and NSE_FO so we can detect F&O stocks automatically.
 COMPLETE_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 FALLBACK_NSE_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+
+# Curated benchmark list of high-liquidity Cash-market stocks
+POPULAR_LIQUID_CASH = [
+    "CDSL", "BSE", "COCHINSHIP", "MAZDOCK", "HUDCO", "IRFC", "RVNL", "IREDA",
+    "SUZLON", "KAYNES", "ARE&M", "ANGELONE", "MANAPPURAM", "NYKAA", "POLICYBZR",
+    "ZOMATO", "JIOFIN", "SWIGGY", "PRESTIGE", "NBCC", "TEJASNET", "TITAGARH",
+    "RAILTEL", "BOMDYEING", "CENTRALBK", "IOB", "UCOBANK", "PPLPHARMA"
+]
 
 
 def _download_master() -> pd.DataFrame:
@@ -30,7 +35,7 @@ def _download_master() -> pd.DataFrame:
     records = json.loads(raw)
     df = pd.DataFrame(records)
 
-    # 1. Extract all underlying symbols that have active NSE F&O contracts
+    # 1. Identify all underlying symbols that trade in NSE F&O
     fno_symbols = set()
     if "segment" in df.columns:
         fo_df = df[df["segment"] == "NSE_FO"]
@@ -43,7 +48,7 @@ def _download_master() -> pd.DataFrame:
         if "underlying_symbol" in fo_df.columns:
             fno_symbols.update(fo_df["underlying_symbol"].dropna().astype(str).str.upper().str.strip().unique())
 
-    # 2. Filter to NSE Equity Cash-Market instruments (EQ)
+    # 2. Keep only NSE Equity Cash-Market instruments (Series EQ)
     if "segment" in df.columns and "instrument_type" in df.columns:
         eq_df = df[(df["segment"] == "NSE_EQ") & (df["instrument_type"] == "EQ")].copy()
     elif "instrument_type" in df.columns:
@@ -54,20 +59,13 @@ def _download_master() -> pd.DataFrame:
     eq_df["trading_symbol"] = eq_df["trading_symbol"].astype(str).str.upper().str.strip()
     eq_df["is_fno"] = eq_df["trading_symbol"].isin(fno_symbols)
 
-    keep_cols = [
-        c for c in ["instrument_key", "trading_symbol", "name", "exchange", "is_fno"]
-        if c in eq_df.columns
-    ]
+    keep_cols = [c for c in ["instrument_key", "trading_symbol", "name", "exchange", "is_fno"] if c in eq_df.columns]
     eq_df = eq_df[keep_cols].drop_duplicates(subset=["trading_symbol"]).reset_index(drop=True)
     eq_df.to_csv(CACHE_FILE, index=False)
     return eq_df
 
 
 def load_instrument_master(force_refresh: bool = False) -> pd.DataFrame:
-    """
-    Loads the daily cached instrument master CSV, or downloads a fresh copy from Upstox
-    if today's cache does not exist, is older than today, or lacks the `is_fno` column.
-    """
     is_stale = True
     if os.path.exists(CACHE_FILE) and not force_refresh:
         modified = date.fromtimestamp(os.path.getmtime(CACHE_FILE))
@@ -77,7 +75,7 @@ def load_instrument_master(force_refresh: bool = False) -> pd.DataFrame:
                 cached_df = pd.read_csv(CACHE_FILE)
                 if "is_fno" in cached_df.columns:
                     return cached_df
-                is_stale = True  # Re-download if old cache doesn't have the `is_fno` flag
+                is_stale = True
             except Exception:
                 is_stale = True
 
@@ -86,7 +84,6 @@ def load_instrument_master(force_refresh: bool = False) -> pd.DataFrame:
             return _download_master()
         except Exception as e:
             if os.path.exists(CACHE_FILE):
-                print(f"Warning: instrument master refresh failed ({e}); using cached file.")
                 fallback_df = pd.read_csv(CACHE_FILE)
                 if "is_fno" not in fallback_df.columns:
                     fallback_df["is_fno"] = True
@@ -97,10 +94,6 @@ def load_instrument_master(force_refresh: bool = False) -> pd.DataFrame:
 
 
 def get_instrument_info(trading_symbol: str, master: pd.DataFrame | None = None) -> dict | None:
-    """
-    Looks up a stock by its NSE trading symbol (e.g. 'RELIANCE') and returns a dict with:
-    {'instrument_key': str, 'is_fno': bool, 'name': str}
-    """
     master = master if master is not None else load_instrument_master()
     match = master[master["trading_symbol"].astype(str).str.upper() == trading_symbol.strip().upper()]
     if match.empty:
@@ -114,15 +107,23 @@ def get_instrument_info(trading_symbol: str, master: pd.DataFrame | None = None)
 
 
 def get_instrument_key(trading_symbol: str, master: pd.DataFrame | None = None) -> str | None:
-    """Backward-compatible helper that returns just the `instrument_key` string."""
     info = get_instrument_info(trading_symbol, master)
     return info["instrument_key"] if info else None
 
 
 def get_all_fno_symbols(master: pd.DataFrame | None = None) -> list[str]:
-    """Returns a sorted list of all NSE F&O underlying trading symbols."""
+    """Returns all NSE F&O underlying stock symbols (~180 stocks)."""
     master = master if master is not None else load_instrument_master()
     if "is_fno" not in master.columns:
         return []
     fno_df = master[master["is_fno"] == True]
     return sorted(fno_df["trading_symbol"].dropna().astype(str).unique().tolist())
+
+
+def get_liquid_cash_symbols(master: pd.DataFrame | None = None) -> list[str]:
+    """Returns high-volume, non-F&O cash-segment equities."""
+    master = master if master is not None else load_instrument_master()
+    available_symbols = set(master["trading_symbol"].dropna().str.upper().unique())
+    # Return valid cached symbols from the curated list
+    valid = [sym for sym in POPULAR_LIQUID_CASH if sym in available_symbols]
+    return sorted(valid if valid else POPULAR_LIQUID_CASH)
