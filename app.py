@@ -7,16 +7,143 @@ Run locally with:  streamlit run app.py
 """
 import time
 from datetime import date
+from urllib.parse import urlencode
+import inspect
+import requests
 import streamlit as st
 import pandas as pd
 
 import config
-import upstox_auth
 import instruments
 import data_fetch
 import strategy
-import intraday_strategy
 
+# Optional import for intraday_strategy with built-in fallback
+try:
+    import intraday_strategy
+except ModuleNotFoundError:
+    import numpy as np
+
+    class intraday_strategy:
+        @staticmethod
+        def scan_for_tomorrow_intraday(df: pd.DataFrame, is_fno: bool = True) -> dict:
+            if len(df) < 25:
+                return {"intraday_setup": "INSUFFICIENT_DATA"}
+            df = df.copy()
+            df["avg_vol20"] = df["volume"].rolling(20).mean()
+            df["day_range"] = df["high"] - df["low"]
+            df["range_pos"] = np.where(df["day_range"] > 0, (df["close"] - df["low"]) / df["day_range"], 0.5)
+            df["min_range_7"] = df["day_range"].rolling(7).min()
+
+            high_low = df["high"] - df["low"]
+            high_close = (df["high"] - df["close"].shift(1)).abs()
+            low_close = (df["low"] - df["close"].shift(1)).abs()
+            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            df["atr14"] = tr.rolling(14).mean()
+
+            row = df.iloc[-1]
+            prev = df.iloc[-2]
+            day_pct = ((row["close"] - prev["close"]) / prev["close"]) * 100
+            vol_mult = row["volume"] / row["avg_vol20"] if row["avg_vol20"] > 0 else 0
+            is_nr7 = row["day_range"] <= row["min_range_7"]
+
+            pivot = (row["high"] + row["low"] + row["close"]) / 3.0
+            r1 = (2 * pivot) - row["low"]
+            s1 = (2 * pivot) - row["high"]
+
+            setup = "NONE"
+            execution_plan = "-"
+            if day_pct >= 2.5 and row["range_pos"] >= 0.75 and vol_mult >= 1.4:
+                setup = "LONG: Top Gainer Continuation"
+                execution_plan = f"Buy above 15m ORB High or {row['high']:.2f} | SL: {pivot:.2f} | Tgt: {r1:.2f}"
+            elif day_pct <= -2.5 and row["range_pos"] <= 0.25 and vol_mult >= 1.4:
+                setup = "SHORT: Top Loser Continuation"
+                execution_plan = f"Sell below 15m ORB Low or {row['low']:.2f} | SL: {pivot:.2f} | Tgt: {s1:.2f}"
+            elif is_nr7 and row["close"] > 100:
+                setup = "BOTH SIDES: NR7 Breakout"
+                execution_plan = f"Buy > {row['high']:.2f} (Tgt {r1:.2f}) OR Short < {row['low']:.2f} (Tgt {s1:.2f})"
+
+            return {
+                "intraday_setup": setup,
+                "segment": "F&O" if is_fno else "CASH",
+                "close": round(row["close"], 2),
+                "day_pct": round(day_pct, 2),
+                "close_strength_%": round(row["range_pos"] * 100, 1),
+                "vol_mult": round(vol_mult, 2),
+                "nr7_day": bool(is_nr7),
+                "tomorrow_pivot": round(pivot, 2),
+                "tomorrow_R1": round(r1, 2),
+                "tomorrow_S1": round(s1, 2),
+                "atr_14": round(row["atr14"], 2),
+                "execution_plan": execution_plan,
+                "date": row["timestamp"].date().isoformat(),
+            }
+
+# Built-in fallback for upstox_auth so missing upstox_auth.py never crashes the app
+try:
+    import upstox_auth
+except ModuleNotFoundError:
+    class upstox_auth:
+        @staticmethod
+        def build_login_url() -> str:
+            params = {
+                "response_type": "code",
+                "client_id": config.CLIENT_ID,
+                "redirect_uri": config.REDIRECT_URI,
+            }
+            return f"{config.BASE_URL}/login/authorization/dialog?{urlencode(params)}"
+
+        @staticmethod
+        def exchange_code_for_token(auth_code: str) -> dict:
+            url = f"{config.BASE_URL}/login/authorization/token"
+            headers = {
+                "accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            data = {
+                "code": auth_code,
+                "client_id": config.CLIENT_ID,
+                "client_secret": config.CLIENT_SECRET,
+                "redirect_uri": config.REDIRECT_URI,
+                "grant_type": "authorization_code",
+            }
+            resp = requests.post(url, headers=headers, data=data, timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+            token = payload.get("access_token", "")
+            if token:
+                _save_token(token)
+            return payload
+
+
+# ---------------- Safe Config Helper Wrappers ----------------
+def _get_token() -> str:
+    if hasattr(config, "get_access_token"):
+        return config.get_access_token()
+    return st.session_state.get("UPSTOX_ACCESS_TOKEN") or getattr(config, "ACCESS_TOKEN", "")
+
+
+def _save_token(token: str) -> None:
+    token = token.strip()
+    st.session_state["UPSTOX_ACCESS_TOKEN"] = token
+    config.ACCESS_TOKEN = token
+    if hasattr(config, "save_access_token"):
+        try:
+            config.save_access_token(token)
+        except Exception:
+            pass
+
+
+def _set_credentials(client_id: str, client_secret: str, redirect_uri: str) -> None:
+    if hasattr(config, "set_runtime_credentials"):
+        config.set_runtime_credentials(client_id, client_secret, redirect_uri)
+    else:
+        config.CLIENT_ID = client_id.strip()
+        config.CLIENT_SECRET = client_secret.strip()
+        config.REDIRECT_URI = redirect_uri.strip()
+
+
+# ---------------- Page Configuration ----------------
 st.set_page_config(page_title="NSE Swing & Intraday Scanner (Upstox)", layout="wide")
 st.title("📊 NSE EOD Scanner: Swing Strategy & Next-Day Intraday")
 st.caption("Live data via Upstox API v2. Separate EOD engines for Multi-Day Swing and Tomorrow's Intraday.")
@@ -31,7 +158,7 @@ with st.sidebar:
         ui_client_secret = st.text_input("UPSTOX_CLIENT_SECRET", value=config.CLIENT_SECRET, type="password")
         ui_redirect_uri = st.text_input("UPSTOX_REDIRECT_URI", value=config.REDIRECT_URI)
         if st.button("Apply API Keys"):
-            config.set_runtime_credentials(ui_client_id, ui_client_secret, ui_redirect_uri)
+            _set_credentials(ui_client_id, ui_client_secret, ui_redirect_uri)
             st.success("API keys updated for this session.")
 
     if config.credentials_present():
@@ -42,7 +169,9 @@ with st.sidebar:
         if st.button("Exchange code for access token"):
             try:
                 result = upstox_auth.exchange_code_for_token(auth_code.strip())
-                if result.get("access_token"):
+                token = result.get("access_token", "")
+                if token:
+                    _save_token(token)
                     st.success("Logged in! Access token active for today.")
                 else:
                     st.error(f"No access_token in response: {result}")
@@ -54,7 +183,7 @@ with st.sidebar:
     st.markdown("**OR paste an existing Access Token directly:**")
     manual_token = st.text_input("Direct Access Token", type="password")
     if manual_token:
-        config.save_access_token(manual_token.strip())
+        _save_token(manual_token)
         st.success("Direct Access Token saved in session.")
 
     st.divider()
@@ -90,9 +219,13 @@ with st.sidebar:
 
 # ---------------- Main: Run Both Scanners ----------------
 if run_scan:
-    if not config.get_access_token():
+    active_token = _get_token()
+    if not active_token:
         st.error("No access token found. Complete the login step or paste your token in the sidebar first.")
         st.stop()
+
+    # Keep config.ACCESS_TOKEN synced for data_fetch.py
+    config.ACCESS_TOKEN = active_token
 
     with st.spinner("Loading NSE & F&O instrument master..."):
         try:
@@ -102,11 +235,18 @@ if run_scan:
             st.stop()
 
     if universe_mode == "All NSE F&O Stocks (~180 Liquid Stocks)":
-        symbols = instruments.get_all_fno_symbols(master)
+        if hasattr(instruments, "get_all_fno_symbols"):
+            symbols = instruments.get_all_fno_symbols(master)
+        elif "is_fno" in master.columns:
+            symbols = sorted(master[master["is_fno"] == True]["trading_symbol"].dropna().astype(str).unique().tolist())
+        else:
+            symbols = []
+
         if not symbols:
             st.warning("No F&O symbols detected in cache; forcing a fresh download of the master list...")
             master = instruments.load_instrument_master(force_refresh=True)
-            symbols = instruments.get_all_fno_symbols(master)
+            if "is_fno" in master.columns:
+                symbols = sorted(master[master["is_fno"] == True]["trading_symbol"].dropna().astype(str).unique().tolist())
         st.info(f"Loaded **{len(symbols)}** NSE F&O stocks from instrument master.")
     else:
         symbols = [s.strip().upper() for s in watchlist_text.split(",") if s.strip()]
@@ -121,9 +261,17 @@ if run_scan:
     status_text = st.empty()
     total = len(symbols)
 
+    # Check whether strategy.latest_signal accepts is_fno and bear_market_mode
+    sig_params = inspect.signature(strategy.latest_signal).parameters
+
     for i, sym in enumerate(symbols):
         status_text.text(f"Scanning [{i + 1}/{total}]: {sym}...")
-        info = instruments.get_instrument_info(sym, master)
+
+        if hasattr(instruments, "get_instrument_info"):
+            info = instruments.get_instrument_info(sym, master)
+        else:
+            key = instruments.get_instrument_key(sym, master)
+            info = {"instrument_key": key, "is_fno": True, "name": sym} if key else None
 
         if not info:
             swing_rows.append({"symbol": sym, "segment": "UNKNOWN", "signal": "SYMBOL_NOT_FOUND"})
@@ -132,24 +280,23 @@ if run_scan:
             try:
                 candles = data_fetch.get_daily_candles(info["instrument_key"])
 
-                # 1. Evaluate Swing Strategy (BUY all stocks, SELL F&O stocks only)
-                s_sig = strategy.latest_signal(
-                    candles,
-                    is_fno=info["is_fno"],
-                    bear_market_mode=bear_mode,
-                )
+                # 1. Evaluate Swing Strategy
+                if "is_fno" in sig_params and "bear_market_mode" in sig_params:
+                    s_sig = strategy.latest_signal(candles, is_fno=info["is_fno"], bear_market_mode=bear_mode)
+                else:
+                    s_sig = strategy.latest_signal(candles)
+                    if s_sig.get("signal") == "SELL" and not info["is_fno"]:
+                        s_sig["signal"] = "NONE"
+
                 s_sig["symbol"] = sym
+                s_sig.setdefault("segment", "F&O" if info["is_fno"] else "CASH ONLY")
                 swing_rows.append(s_sig)
 
-                # 2. Evaluate Next-Day Intraday Strategy (Top Gainers/Losers, NR7, Pivots)
-                i_sig = intraday_strategy.scan_for_tomorrow_intraday(
-                    candles,
-                    is_fno=info["is_fno"],
-                )
+                # 2. Evaluate Next-Day Intraday Strategy
+                i_sig = intraday_strategy.scan_for_tomorrow_intraday(candles, is_fno=info["is_fno"])
                 i_sig["symbol"] = sym
                 intraday_rows.append(i_sig)
 
-                # Light rate-limit delay when scanning the full F&O universe
                 if total > 40:
                     time.sleep(0.08)
 
@@ -164,7 +311,6 @@ if run_scan:
     df_intra = pd.DataFrame(intraday_rows)
     today_str = date.today().isoformat()
 
-    # Reorder `symbol` and `segment` to be the first columns
     if not df_swing.empty and "symbol" in df_swing.columns:
         lead_cols = [c for c in ["symbol", "segment", "signal"] if c in df_swing.columns]
         other_cols = [c for c in df_swing.columns if c not in lead_cols]
