@@ -2,9 +2,9 @@
 Streamlit dashboard for two independent EOD strategies powered by live Upstox data:
   1. Strategy 1 (Swing): Weekly Breakout + EMA20 (BUY all stocks, SHORT F&O stocks only)
   2. Strategy 2 (Next-Day Intraday): Top Gainers/Losers Continuation, NR7 & Floor Pivots
-
-Run locally with:  streamlit run app.py
 """
+import json
+import os
 import time
 from datetime import date
 from urllib.parse import urlencode
@@ -12,6 +12,7 @@ import inspect
 import requests
 import streamlit as st
 import pandas as pd
+import numpy as np
 
 import config
 import instruments
@@ -22,8 +23,6 @@ import strategy
 try:
     import intraday_strategy
 except ModuleNotFoundError:
-    import numpy as np
-
     class intraday_strategy:
         @staticmethod
         def scan_for_tomorrow_intraday(df: pd.DataFrame, is_fno: bool = True) -> dict:
@@ -79,68 +78,93 @@ except ModuleNotFoundError:
                 "date": row["timestamp"].date().isoformat(),
             }
 
-# Built-in fallback for upstox_auth so missing upstox_auth.py never crashes the app
-try:
-    import upstox_auth
-except ModuleNotFoundError:
-    class upstox_auth:
-        @staticmethod
-        def build_login_url() -> str:
-            params = {
-                "response_type": "code",
-                "client_id": config.CLIENT_ID,
-                "redirect_uri": config.REDIRECT_URI,
-            }
-            return f"{config.BASE_URL}/login/authorization/dialog?{urlencode(params)}"
-
-        @staticmethod
-        def exchange_code_for_token(auth_code: str) -> dict:
-            url = f"{config.BASE_URL}/login/authorization/token"
-            headers = {
-                "accept": "application/json",
-                "Content-Type": "application/x-www-form-urlencoded",
-            }
-            data = {
-                "code": auth_code,
-                "client_id": config.CLIENT_ID,
-                "client_secret": config.CLIENT_SECRET,
-                "redirect_uri": config.REDIRECT_URI,
-                "grant_type": "authorization_code",
-            }
-            resp = requests.post(url, headers=headers, data=data, timeout=15)
-            resp.raise_for_status()
-            payload = resp.json()
-            token = payload.get("access_token", "")
-            if token:
-                _save_token(token)
-            return payload
+# ---------------- Persistent Server Cache (Survives Browser Redirects) ----------------
+CREDS_CACHE_FILE = "/tmp/upstox_runtime_creds.json"
+DEFAULT_CLIENT_ID = "70ae350e-d2e3-449c-a810-db2ea377744d"
+DEFAULT_REDIRECT_URI = "https://intraday-and-swing-ff4te4ohzqic6shtna5f6k.streamlit.app"
 
 
-# ---------------- Safe Config Helper Wrappers ----------------
-def _get_token() -> str:
-    if hasattr(config, "get_access_token"):
-        return config.get_access_token()
-    return st.session_state.get("UPSTOX_ACCESS_TOKEN") or getattr(config, "ACCESS_TOKEN", "")
-
-
-def _save_token(token: str) -> None:
-    token = token.strip()
-    st.session_state["UPSTOX_ACCESS_TOKEN"] = token
-    config.ACCESS_TOKEN = token
-    if hasattr(config, "save_access_token"):
+def _load_cached_creds() -> dict:
+    if os.path.exists(CREDS_CACHE_FILE):
         try:
-            config.save_access_token(token)
+            with open(CREDS_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
             pass
+    return {}
 
 
-def _set_credentials(client_id: str, client_secret: str, redirect_uri: str) -> None:
-    if hasattr(config, "set_runtime_credentials"):
-        config.set_runtime_credentials(client_id, client_secret, redirect_uri)
-    else:
-        config.CLIENT_ID = client_id.strip()
-        config.CLIENT_SECRET = client_secret.strip()
-        config.REDIRECT_URI = redirect_uri.strip()
+def _save_cached_creds(client_id: str = None, client_secret: str = None, redirect_uri: str = None, access_token: str = None) -> dict:
+    data = _load_cached_creds()
+    if client_id is not None:
+        data["client_id"] = client_id.strip()
+    if client_secret is not None:
+        data["client_secret"] = client_secret.strip()
+    if redirect_uri is not None:
+        data["redirect_uri"] = redirect_uri.strip()
+    if access_token is not None:
+        data["access_token"] = access_token.strip()
+        data["token_date"] = date.today().isoformat()
+    try:
+        with open(CREDS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+    return data
+
+
+# Sync cached credentials into config on every page load
+_cached = _load_cached_creds()
+config.CLIENT_ID = _cached.get("client_id") or getattr(config, "CLIENT_ID", "") or DEFAULT_CLIENT_ID
+config.CLIENT_SECRET = _cached.get("client_secret") or getattr(config, "CLIENT_SECRET", "")
+_raw_redirect = _cached.get("redirect_uri") or getattr(config, "REDIRECT_URI", "")
+if not _raw_redirect or "127.0.0.1" in _raw_redirect:
+    config.REDIRECT_URI = DEFAULT_REDIRECT_URI
+else:
+    config.REDIRECT_URI = _raw_redirect
+
+if _cached.get("access_token") and _cached.get("token_date") == date.today().isoformat():
+    config.ACCESS_TOKEN = _cached["access_token"]
+    st.session_state["UPSTOX_ACCESS_TOKEN"] = _cached["access_token"]
+
+
+def _build_login_url() -> str:
+    params = {
+        "response_type": "code",
+        "client_id": config.CLIENT_ID.strip(),
+        "redirect_uri": config.REDIRECT_URI.strip(),
+    }
+    return f"{config.BASE_URL}/login/authorization/dialog?{urlencode(params)}"
+
+
+def _exchange_code(auth_code: str) -> dict:
+    url = f"{config.BASE_URL}/login/authorization/token"
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = {
+        "code": auth_code.strip(),
+        "client_id": config.CLIENT_ID.strip(),
+        "client_secret": config.CLIENT_SECRET.strip(),
+        "redirect_uri": config.REDIRECT_URI.strip(),
+        "grant_type": "authorization_code",
+    }
+    resp = requests.post(url, headers=headers, data=data, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Upstox HTTP {resp.status_code}: {resp.text}")
+    payload = resp.json()
+    token = payload.get("access_token", "")
+    if token:
+        _save_cached_creds(access_token=token)
+        config.ACCESS_TOKEN = token
+        st.session_state["UPSTOX_ACCESS_TOKEN"] = token
+        if hasattr(config, "save_access_token"):
+            try:
+                config.save_access_token(token)
+            except Exception:
+                pass
+    return payload
 
 
 # ---------------- Page Configuration ----------------
@@ -148,43 +172,76 @@ st.set_page_config(page_title="NSE Swing & Intraday Scanner (Upstox)", layout="w
 st.title("📊 NSE EOD Scanner: Swing Strategy & Next-Day Intraday")
 st.caption("Live data via Upstox API v2. Separate EOD engines for Multi-Day Swing and Tomorrow's Intraday.")
 
+# ---------------- Auto-Handle ?code= from URL Redirect ----------------
+url_code = st.query_params.get("code", "")
+if url_code and not config.ACCESS_TOKEN:
+    if config.CLIENT_SECRET:
+        try:
+            res = _exchange_code(url_code)
+            if res.get("access_token"):
+                st.success("✅ Automatically exchanged URL `?code=` for today's Upstox Access Token!")
+                st.query_params.clear()
+        except Exception as e:
+            st.warning(f"URL code detected (`{url_code}`), but auto-exchange failed: {e}")
+    else:
+        st.info(f"🔑 URL Auth Code `{url_code}` detected! Enter your **UPSTOX_CLIENT_SECRET** in the sidebar and click **Save & Exchange Code**.")
+
 # ---------------- Sidebar: Credentials, Login & Watchlist ----------------
 with st.sidebar:
     st.header("1. Upstox Authentication")
-    st.write("Access tokens expire daily. Authenticate once before running your EOD scan.")
 
-    with st.expander("🔑 Broker API Keys (Optional if in Secrets/.env)", expanded=not config.credentials_present()):
-        ui_client_id = st.text_input("UPSTOX_CLIENT_ID", value=config.CLIENT_ID, type="password")
+    if config.ACCESS_TOKEN:
+        st.success("✅ Access Token is ACTIVE for today!")
+        if st.button("Clear / Reset Token"):
+            _save_cached_creds(access_token="")
+            config.ACCESS_TOKEN = ""
+            st.session_state["UPSTOX_ACCESS_TOKEN"] = ""
+            st.rerun()
+
+    with st.expander("🔑 Step A: Save Broker API Keys (Once)", expanded=not bool(config.CLIENT_SECRET)):
+        ui_client_id = st.text_input("UPSTOX_CLIENT_ID", value=config.CLIENT_ID)
         ui_client_secret = st.text_input("UPSTOX_CLIENT_SECRET", value=config.CLIENT_SECRET, type="password")
         ui_redirect_uri = st.text_input("UPSTOX_REDIRECT_URI", value=config.REDIRECT_URI)
-        if st.button("Apply API Keys"):
-            _set_credentials(ui_client_id, ui_client_secret, ui_redirect_uri)
-            st.success("API keys updated for this session.")
+        if st.button("💾 Save API Keys", use_container_width=True):
+            _save_cached_creds(
+                client_id=ui_client_id,
+                client_secret=ui_client_secret,
+                redirect_uri=ui_redirect_uri,
+            )
+            config.CLIENT_ID = ui_client_id.strip()
+            config.CLIENT_SECRET = ui_client_secret.strip()
+            config.REDIRECT_URI = ui_redirect_uri.strip()
+            st.success("Keys saved to server cache! They will now survive browser redirects.")
+            st.rerun()
 
-    if config.credentials_present():
-        login_url = upstox_auth.build_login_url()
-        st.markdown(f"**[Step 1: Click here to log in to Upstox]({login_url})**")
-        st.write("Step 2: Copy the `code=` value from the redirected URL and paste below.")
-        auth_code = st.text_input("Paste auth code here", type="password")
-        if st.button("Exchange code for access token"):
-            try:
-                result = upstox_auth.exchange_code_for_token(auth_code.strip())
-                token = result.get("access_token", "")
-                if token:
-                    _save_token(token)
-                    st.success("Logged in! Access token active for today.")
-                else:
-                    st.error(f"No access_token in response: {result}")
-            except Exception as e:
-                st.error(f"Login failed: {e}")
-    else:
-        st.warning("Enter your UPSTOX_CLIENT_ID & SECRET above, or paste a Direct Access Token below.")
+    if config.CLIENT_ID and config.CLIENT_SECRET:
+        login_url = _build_login_url()
+        st.markdown(f"**[👉 Step B: Click here to log in to Upstox]({login_url})**")
+        st.caption("After login, Upstox redirects back here and activates your token automatically, or you can paste `code=` below:")
 
-    st.markdown("**OR paste an existing Access Token directly:**")
+        auth_code_input = st.text_input("Auth Code (`code=` from URL)", value=url_code)
+        if st.button("Exchange code for access token", use_container_width=True):
+            if not auth_code_input.strip():
+                st.error("Paste the code from `?code=...` first.")
+            else:
+                try:
+                    result = _exchange_code(auth_code_input.strip())
+                    if result.get("access_token"):
+                        st.query_params.clear()
+                        st.success("Logged in! Access token active for today.")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Exchange failed: {e}")
+
+    st.markdown("---")
+    st.markdown("**OR paste an Access Token directly from Upstox Portal:**")
     manual_token = st.text_input("Direct Access Token", type="password")
-    if manual_token:
-        _save_token(manual_token)
-        st.success("Direct Access Token saved in session.")
+    if st.button("Apply Direct Token", use_container_width=True) and manual_token:
+        _save_cached_creds(access_token=manual_token.strip())
+        config.ACCESS_TOKEN = manual_token.strip()
+        st.session_state["UPSTOX_ACCESS_TOKEN"] = manual_token.strip()
+        st.success("Direct Access Token saved and active!")
+        st.rerun()
 
     st.divider()
     st.header("2. Watchlist & Strategy Settings")
@@ -204,14 +261,13 @@ with st.sidebar:
     watchlist_text = st.text_area(
         "NSE trading symbols (comma-separated)",
         value=default_watchlist,
-        height=120,
+        height=110,
         disabled=(universe_mode != "Custom Symbol List"),
     )
 
     bear_mode = st.checkbox(
         "Downtrend Market Mode (Relax 200-DMA for Swing Buys)",
         value=True,
-        help="When checked, Swing BUY setups require price > 50 DMA & 20 EMA (skipping 200 DMA) to catch early relative-strength breakouts in a correcting market.",
     )
     force_master_refresh = st.checkbox("Force refresh NSE Instrument Master", value=False)
 
@@ -219,13 +275,9 @@ with st.sidebar:
 
 # ---------------- Main: Run Both Scanners ----------------
 if run_scan:
-    active_token = _get_token()
-    if not active_token:
-        st.error("No access token found. Complete the login step or paste your token in the sidebar first.")
+    if not config.ACCESS_TOKEN:
+        st.error("No Access Token active. Either complete Step A & B in the sidebar, or paste a Direct Access Token from your Upstox Developer Portal.")
         st.stop()
-
-    # Keep config.ACCESS_TOKEN synced for data_fetch.py
-    config.ACCESS_TOKEN = active_token
 
     with st.spinner("Loading NSE & F&O instrument master..."):
         try:
@@ -243,7 +295,6 @@ if run_scan:
             symbols = []
 
         if not symbols:
-            st.warning("No F&O symbols detected in cache; forcing a fresh download of the master list...")
             master = instruments.load_instrument_master(force_refresh=True)
             if "is_fno" in master.columns:
                 symbols = sorted(master[master["is_fno"] == True]["trading_symbol"].dropna().astype(str).unique().tolist())
@@ -251,17 +302,12 @@ if run_scan:
     else:
         symbols = [s.strip().upper() for s in watchlist_text.split(",") if s.strip()]
 
-    if not symbols:
-        st.warning("Watchlist is empty. Enter at least one symbol.")
-        st.stop()
-
     swing_rows = []
     intraday_rows = []
     progress = st.progress(0.0)
     status_text = st.empty()
     total = len(symbols)
 
-    # Check whether strategy.latest_signal accepts is_fno and bear_market_mode
     sig_params = inspect.signature(strategy.latest_signal).parameters
 
     for i, sym in enumerate(symbols):
@@ -280,7 +326,6 @@ if run_scan:
             try:
                 candles = data_fetch.get_daily_candles(info["instrument_key"])
 
-                # 1. Evaluate Swing Strategy
                 if "is_fno" in sig_params and "bear_market_mode" in sig_params:
                     s_sig = strategy.latest_signal(candles, is_fno=info["is_fno"], bear_market_mode=bear_mode)
                 else:
@@ -292,7 +337,6 @@ if run_scan:
                 s_sig.setdefault("segment", "F&O" if info["is_fno"] else "CASH ONLY")
                 swing_rows.append(s_sig)
 
-                # 2. Evaluate Next-Day Intraday Strategy
                 i_sig = intraday_strategy.scan_for_tomorrow_intraday(candles, is_fno=info["is_fno"])
                 i_sig["symbol"] = sym
                 intraday_rows.append(i_sig)
@@ -321,17 +365,13 @@ if run_scan:
         other_cols = [c for c in df_intra.columns if c not in lead_cols]
         df_intra = df_intra[lead_cols + other_cols]
 
-    # ---------------- Display Separate Strategy Tabs ----------------
     tab_swing, tab_intraday = st.tabs([
         "📈 Strategy 1: Swing Trading (Weekly Breakout + EMA20)",
         "⚡ Strategy 2: Next-Day Intraday (Top Gainers/Losers & NR7)",
     ])
 
-    # ================= TAB 1: SWING TRADING =================
     with tab_swing:
         st.subheader("Multi-Day Swing Setups (Evaluated at EOD)")
-        st.caption("Rules: **BUY** signals apply to all stocks (Cash & F&O). **SELL/SHORT** signals are strictly restricted to F&O stocks.")
-
         if not df_swing.empty and "signal" in df_swing.columns:
             buys = df_swing[df_swing["signal"].astype(str).str.startswith("BUY")]
             sells = df_swing[df_swing["signal"].astype(str).str.startswith("SELL")]
@@ -339,17 +379,10 @@ if run_scan:
             col1, col2 = st.columns(2)
             with col1:
                 st.success(f"🟢 SWING BUY Signals — Cash & F&O ({len(buys)})")
-                if not buys.empty:
-                    st.dataframe(buys, use_container_width=True, hide_index=True)
-                else:
-                    st.write("No Swing Buy breakouts triggered today.")
-
+                st.dataframe(buys, use_container_width=True, hide_index=True) if not buys.empty else st.write("No Swing Buy breakouts today.")
             with col2:
                 st.error(f"🔴 SWING SHORT Signals — F&O Only ({len(sells)})")
-                if not sells.empty:
-                    st.dataframe(sells, use_container_width=True, hide_index=True)
-                else:
-                    st.write("No Swing Short breakdowns triggered today.")
+                st.dataframe(sells, use_container_width=True, hide_index=True) if not sells.empty else st.write("No Swing Short breakdowns today.")
 
             st.download_button(
                 label="📥 Download Swing Watchlist CSV",
@@ -357,45 +390,30 @@ if run_scan:
                 file_name=f"swing_watchlist_{today_str}.csv",
                 mime="text/csv",
             )
-
             with st.expander("Full Swing Scan Output (All Scanned Symbols)"):
                 st.dataframe(df_swing, use_container_width=True, hide_index=True)
 
-    # ================= TAB 2: NEXT-DAY INTRADAY =================
     with tab_intraday:
         st.subheader("Tomorrow's Intraday Watchlist & Market Movers")
-        st.caption("Identifies today's strongest Gainers, weakest Losers, and NR7 coiled setups with pre-calculated Floor Pivots for tomorrow morning.")
-
         valid_intra = (
             df_intra[pd.notna(df_intra.get("day_pct"))].copy()
             if not df_intra.empty and "day_pct" in df_intra.columns
             else pd.DataFrame()
         )
-
         if not valid_intra.empty:
             st.markdown("#### 1. Today's Top Market Movers (Momentum Context)")
             g_col, l_col = st.columns(2)
-            mover_cols = [
-                c for c in ["symbol", "segment", "close", "day_pct", "vol_mult", "close_strength_%"]
-                if c in valid_intra.columns
-            ]
-
+            mover_cols = [c for c in ["symbol", "segment", "close", "day_pct", "vol_mult", "close_strength_%"] if c in valid_intra.columns]
             with g_col:
                 st.markdown("**🔥 Top 10 Gainers Today**")
-                top_gainers = valid_intra.sort_values("day_pct", ascending=False).head(10)
-                st.dataframe(top_gainers[mover_cols], use_container_width=True, hide_index=True)
-
+                st.dataframe(valid_intra.sort_values("day_pct", ascending=False).head(10)[mover_cols], use_container_width=True, hide_index=True)
             with l_col:
                 st.markdown("**❄️ Top 10 Losers Today**")
-                top_losers = valid_intra.sort_values("day_pct", ascending=True).head(10)
-                st.dataframe(top_losers[mover_cols], use_container_width=True, hide_index=True)
+                st.dataframe(valid_intra.sort_values("day_pct", ascending=True).head(10)[mover_cols], use_container_width=True, hide_index=True)
 
             st.divider()
             st.markdown("#### 2. Actionable Intraday Setups for Tomorrow (9:15 AM – 3:15 PM)")
-            actionable_intra = valid_intra[
-                ~valid_intra["intraday_setup"].isin(["NONE", "INSUFFICIENT_DATA", "SYMBOL_NOT_FOUND"])
-            ]
-
+            actionable_intra = valid_intra[~valid_intra["intraday_setup"].isin(["NONE", "INSUFFICIENT_DATA", "SYMBOL_NOT_FOUND"])]
             if not actionable_intra.empty:
                 plan_cols = [
                     c for c in [
@@ -415,10 +433,9 @@ if run_scan:
                 file_name=f"intraday_watchlist_{today_str}.csv",
                 mime="text/csv",
             )
-
             with st.expander("Full Intraday Scan & Pivot Table (All Scanned Symbols)"):
                 st.dataframe(df_intra, use_container_width=True, hide_index=True)
         else:
             st.warning("No valid candle data returned to compute intraday metrics.")
 else:
-    st.info("👈 Authenticate in the sidebar, choose your watchlist universe, and click **Run Both EOD Scanners**.")
+    st.info("👈 Save your `UPSTOX_CLIENT_SECRET` once in Step A, click Step B to log in (or paste a Direct Access Token), and click **Run Both EOD Scanners**.")
