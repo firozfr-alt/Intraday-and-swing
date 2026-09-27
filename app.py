@@ -1,197 +1,140 @@
 import streamlit as st
-import requests
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+import config
+import upstox_auth
+import instruments
+import data_fetch
+import strategy
+import intraday_strategy
 
-st.set_page_config(page_title="Dual-Engine Screener (Swing & Intraday)", layout="wide")
+st.set_page_config(page_title="Upstox EOD Swing & Intraday Scanner", layout="wide")
+st.title("📊 NSE EOD Scanner: Swing Strategy & Next-Day Intraday")
+st.caption("Live data via Upstox API v2. Separate EOD engines for Multi-Day Swing and Tomorrow's Intraday.")
 
-# ==========================================
-# 1. UPSTOX DATA ENGINE
-# ==========================================
-def fetch_upstox_candles(instrument_key, token, days=80):
-    to_date = datetime.today().strftime('%Y-%m-%d')
-    from_date = (datetime.today() - timedelta(days=days)).strftime('%Y-%m-%d')
-    url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/day/{to_date}/{from_date}"
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-    
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            raw = r.json().get("data", {}).get("candles", [])
-            if not raw:
-                return pd.DataFrame()
-            df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            return df.sort_values("timestamp").reset_index(drop=True)
-    except Exception:
-        pass
-    return pd.DataFrame()
+# ---------------- Sidebar: Credentials & Login ----------------
+with st.sidebar:
+    st.header("1. Upstox Authentication")
 
-def get_technical_indicators(df):
-    df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["Vol_SMA20"] = df["volume"].rolling(20).mean()
-    
-    # RSI 14
-    delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0.0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df["RSI"] = 100 - (100 / (1 + rs))
-    
-    df["Daily_Range"] = df["high"] - df["low"]
-    df["NR7"] = df["Daily_Range"] == df["Daily_Range"].rolling(7).min()
-    return df
+    with st.expander("🔑 Enter Broker API Keys (Optional if in Secrets/.env)", expanded=not config.credentials_present()):
+        ui_client_id = st.text_input("UPSTOX_CLIENT_ID", value=config.CLIENT_ID, type="password")
+        ui_client_secret = st.text_input("UPSTOX_CLIENT_SECRET", value=config.CLIENT_SECRET, type="password")
+        ui_redirect_uri = st.text_input("UPSTOX_REDIRECT_URI", value=config.REDIRECT_URI)
+        if st.button("Apply API Keys"):
+            config.set_runtime_credentials(ui_client_id, ui_client_secret, ui_redirect_uri)
+            st.success("API keys updated in memory.")
 
-# ==========================================
-# 2. INDEPENDENT STRATEGY 1: SWING ENGINE
-# ==========================================
-def run_swing_scanner(df, nifty_ret_20d, symbol, is_fno):
-    if len(df) < 50:
-        return None
-    latest = df.iloc[-1]
-    prev_20 = df.iloc[-21]
-    
-    stock_ret_20d = ((latest["close"] - prev_20["close"]) / prev_20["close"]) * 100
-    relative_strength = stock_ret_20d - nifty_ret_20d
-    vol_ratio = latest["volume"] / latest["Vol_SMA20"] if latest["Vol_SMA20"] > 0 else 0
-    
-    # SWING BUY (Cash & F&O)
-    if (latest["close"] > latest["EMA20"] > latest["EMA50"]) and (relative_strength >= 3.0) and (55 <= latest["RSI"] <= 70) and (vol_ratio >= 1.2):
-        return {
-            "Symbol": symbol,
-            "Type": "SWING BUY",
-            "Instrument": "Cash / F&O",
-            "CMP": round(latest["close"], 2),
-            "Buy Above": round(latest["high"] * 1.001, 2),
-            "Stop Loss (20 EMA)": round(latest["EMA20"], 2),
-            "20D vs Nifty (%)": f"+{relative_strength:.1f}%",
-            "RSI": round(latest["RSI"], 1),
-            "Vol Multiple": f"{vol_ratio:.1f}x"
-        }
-    
-    # SWING SHORT (F&O Only)
-    if is_fno and (latest["close"] < latest["EMA20"] < latest["EMA50"]) and (relative_strength <= -3.0) and (latest["RSI"] <= 42) and (vol_ratio >= 1.1):
-        return {
-            "Symbol": symbol,
-            "Type": "SWING SHORT",
-            "Instrument": "F&O Only",
-            "CMP": round(latest["close"], 2),
-            "Sell Below": round(latest["low"] * 0.999, 2),
-            "Stop Loss (20 EMA)": round(latest["EMA20"], 2),
-            "20D vs Nifty (%)": f"{relative_strength:.1f}%",
-            "RSI": round(latest["RSI"], 1),
-            "Vol Multiple": f"{vol_ratio:.1f}x"
-        }
-    return None
+    if config.credentials_present():
+        login_url = upstox_auth.build_login_url()
+        st.markdown(f"**[Step 1: Click here to log in to Upstox]({login_url})**")
+        auth_code = st.text_input("Step 2: Paste `code=` from redirect URL", type="password")
+        if st.button("Exchange code for token"):
+            try:
+                result = upstox_auth.exchange_code_for_token(auth_code.strip())
+                if result.get("access_token"):
+                    st.success("Token active for today!")
+            except Exception as e:
+                st.error(f"Login failed: {e}")
 
-# ==========================================
-# 3. INDEPENDENT STRATEGY 2: INTRADAY ENGINE
-# ==========================================
-def run_intraday_scanner(df, symbol, is_fno):
-    if len(df) < 10 or not is_fno:
-        return None  # Intraday scanner prioritizes high-liquidity F&O stocks
-    
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    day_pct = ((latest["close"] - prev["close"]) / prev["close"]) * 100
-    daily_range = latest["Daily_Range"]
-    clv = (latest["close"] - latest["low"]) / daily_range if daily_range > 0 else 0.5
-    vol_ratio = latest["volume"] / latest["Vol_SMA20"] if latest["Vol_SMA20"] > 0 else 0
+    st.markdown("**OR paste an existing Access Token directly:**")
+    manual_token = st.text_input("Direct Access Token", type="password")
+    if manual_token:
+        config.save_access_token(manual_token.strip())
+        st.success("Direct Access Token active.")
 
-    # Setup A: Momentum Follow-through
-    if day_pct >= 2.5 and clv >= 0.80 and vol_ratio >= 1.5:
-        return {
-            "Symbol": symbol,
-            "Intraday Bias": "LONG (Momentum Continuation)",
-            "Trigger Condition": "Break of 15m ORB High + Above VWAP",
-            "Today %": f"+{day_pct:.2f}%",
-            "Volume Surge": f"{vol_ratio:.1f}x",
-            "Key Level to Watch": latest["high"]
-        }
-    if day_pct <= -2.5 and clv <= 0.20 and vol_ratio >= 1.5:
-        return {
-            "Symbol": symbol,
-            "Intraday Bias": "SHORT (Selloff Continuation)",
-            "Trigger Condition": "Break of 15m ORB Low + Below VWAP",
-            "Today %": f"{day_pct:.2f}%",
-            "Volume Surge": f"{vol_ratio:.1f}x",
-            "Key Level to Watch": latest["low"]
-        }
-        
-    # Setup B: NR7 Volatility Contraction
-    if latest["NR7"] and vol_ratio < 1.1:
-        return {
-            "Symbol": symbol,
-            "Intraday Bias": "NEUTRAL (NR7 Compression Breakout)",
-            "Trigger Condition": "Trade ORB in Direction of 9:30 AM Breakout",
-            "Today %": f"{day_pct:.2f}%",
-            "Volume Surge": f"{vol_ratio:.1f}x (Dry Volume)",
-            "Key Level to Watch": f"H: {latest['high']} | L: {latest['low']}"
-        }
-    return None
+    st.divider()
+    st.header("2. Watchlist & Filters")
+    default_watchlist = (
+        "RELIANCE, TCS, HDFCBANK, INFY, ICICIBANK, SBIN, TATAMOTORS, "
+        "BAJFINANCE, LT, AXISBANK, SUNPHARMA, NTPCBANK, TRENT, DIXON, BEL, HAL, CDSL, BSE"
+    )
+    watchlist_text = st.text_area("NSE trading symbols (comma-separated)", value=default_watchlist, height=130)
+    bear_mode = st.checkbox("Downtrend Market Mode (Relax 200-DMA for Swing Buys)", value=True)
+    run_scan = st.button("🚀 Run Both EOD Scanners", type="primary", use_container_width=True)
 
-# ==========================================
-# 4. STREAMLIT USER INTERFACE
-# ==========================================
-st.sidebar.title("Configuration")
-upstox_token = st.sidebar.text_input("Upstox Access Token", type="password")
+# ---------------- Main Execution ----------------
+if run_scan:
+    if not config.get_access_token():
+        st.error("No Access Token found. Log in or paste your token in the sidebar first.")
+        st.stop()
 
-# Candidate universe
-STOCKS = [
-    {"symbol": "RELIANCE", "key": "NSE_EQ|INE002A01018", "is_fno": True},
-    {"symbol": "HDFCBANK", "key": "NSE_EQ|INE040A01034", "is_fno": True},
-    {"symbol": "INFY", "key": "NSE_EQ|INE009A01021", "is_fno": True},
-    {"symbol": "TATASTEEL", "key": "NSE_EQ|INE081A01020", "is_fno": True},
-    {"symbol": "SBIN", "key": "NSE_EQ|INE062A01020", "is_fno": True},
-    {"symbol": "DIXON", "key": "NSE_EQ|INE935N01020", "is_fno": True},
-    {"symbol": "KAYNES", "key": "NSE_EQ|INE918Z01012", "is_fno": False},  # Cash midcap
-]
+    symbols = [s.strip().upper() for s in watchlist_text.split(",") if s.strip()]
+    with st.spinner("Loading NSE & F&O instrument master..."):
+        try:
+            master = instruments.load_instrument_master()
+        except Exception as e:
+            st.error(f"Could not load instrument master: {e}")
+            st.stop()
 
-if st.button("Run Daily Analysis"):
-    if not upstox_token:
-        st.warning("Please supply an Upstox access token in the sidebar.")
-    else:
-        with st.spinner("Processing EOD candles..."):
-            nifty_df = fetch_upstox_candles("NSE_INDEX|Nifty 50", upstox_token)
-            nifty_ret = 0.0
-            if len(nifty_df) >= 21:
-                nifty_ret = ((nifty_df.iloc[-1]["close"] - nifty_df.iloc[-21]["close"]) / nifty_df.iloc[-21]["close"]) * 100
-                
-            swing_results, intraday_results = [], []
-            
-            for item in STOCKS:
-                df = fetch_upstox_candles(item["key"], upstox_token)
-                if not df.empty:
-                    df = get_technical_indicators(df)
-                    
-                    # Run Strategy 1
-                    s_res = run_swing_scanner(df, nifty_ret, item["symbol"], item["is_fno"])
-                    if s_res:
-                        swing_results.append(s_res)
-                        
-                    # Run Strategy 2
-                    i_res = run_intraday_scanner(df, item["symbol"], item["is_fno"])
-                    if i_res:
-                        intraday_results.append(i_res)
-            
-            # Display Outputs Separately
-            tab_swing, tab_intraday = st.tabs(["📌 Strategy 1: Swing Trading (3-15 Days)", "⚡ Strategy 2: Tomorrow's Intraday Watchlist"])
-            
-            with tab_swing:
-                st.subheader(f"Nifty 50 (20-Day Baseline: {nifty_ret:.2f}%)")
-                st.caption("Holds positions over several days. Prioritizes Relative Strength, Volume Expansion, and EMA alignment.")
-                if swing_results:
-                    st.dataframe(pd.DataFrame(swing_results), use_container_width=True)
-                else:
-                    st.info("No stocks met the swing trading criteria today.")
-                    
-            with tab_intraday:
-                st.subheader("High-Probability Setups for Tomorrow's Session")
-                st.caption("Purely for day trades. Do not hold overnight. Wait for the 9:15-9:30 AM 15-minute range confirmation.")
-                if intraday_results:
-                    st.dataframe(pd.DataFrame(intraday_results), use_container_width=True)
-                else:
-                    st.info("No stocks qualified for tomorrow's momentum or NR7 intraday list.")
+    swing_rows = []
+    intraday_rows = []
+    progress = st.progress(0.0)
+
+    for i, sym in enumerate(symbols):
+        info = instruments.get_instrument_info(sym, master)
+        if not info:
+            swing_rows.append({"symbol": sym, "signal": "SYMBOL_NOT_FOUND"})
+        else:
+            try:
+                candles = data_fetch.get_daily_candles(info["instrument_key"])
+                # Run Strategy 1: Swing
+                s_sig = strategy.latest_signal(candles, is_fno=info["is_fno"], bear_market_mode=bear_mode)
+                s_sig["symbol"] = sym
+                swing_rows.append(s_sig)
+
+                # Run Strategy 2: Next-Day Intraday
+                i_sig = intraday_strategy.scan_for_tomorrow_intraday(candles, is_fno=info["is_fno"])
+                i_sig["symbol"] = sym
+                intraday_rows.append(i_sig)
+            except Exception as e:
+                swing_rows.append({"symbol": sym, "signal": f"ERROR: {e}"})
+        progress.progress((i + 1) / len(symbols))
+
+    df_swing = pd.DataFrame(swing_rows)
+    df_intra = pd.DataFrame(intraday_rows)
+
+    tab_swing, tab_intraday = st.tabs([
+        "📈 Strategy 1: Swing Trading (Weekly Breakout + EMA20)",
+        "⚡ Strategy 2: Next-Day Intraday (Top Gainers/Losers & NR7)"
+    ])
+
+    # --- TAB 1: SWING STRATEGY ---
+    with tab_swing:
+        st.markdown("#### Rules: BUY = All Stocks (Cash + F&O) | SELL = F&O Stocks Only")
+        buys = df_swing[df_swing["signal"].astype(str).str.startswith("BUY")] if "signal" in df_swing else pd.DataFrame()
+        sells = df_swing[df_swing["signal"].astype(str).str.startswith("SELL")] if "signal" in df_swing else pd.DataFrame()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.success(f"🟢 SWING BUY Setups ({len(buys)})")
+            st.dataframe(buys, use_container_width=True) if not buys.empty else st.write("No Swing Buy breakouts today.")
+        with c2:
+            st.error(f"🔴 SWING SHORT Setups - F&O Only ({len(sells)})")
+            st.dataframe(sells, use_container_width=True) if not sells.empty else st.write("No Swing Short breakdowns today.")
+
+        with st.expander("View Full Swing Scan Table"):
+            st.dataframe(df_swing, use_container_width=True)
+
+    # --- TAB 2: INTRADAY NEXT-DAY STRATEGY ---
+    with tab_intraday:
+        if not df_intra.empty and "day_pct" in df_intra.columns:
+            st.markdown("#### 1. Today's Market Movers (Context for Tomorrow)")
+            g1, g2 = st.columns(2)
+            with g1:
+                st.markdown("**🔥 Today's Top Gainers**")
+                st.dataframe(df_intra.sort_values("day_pct", ascending=False).head(5)[["symbol", "segment", "close", "day_pct", "vol_mult", "close_strength_%"]], use_container_width=True)
+            with g2:
+                st.markdown("**❄️ Today's Top Losers**")
+                st.dataframe(df_intra.sort_values("day_pct", ascending=True).head(5)[["symbol", "segment", "close", "day_pct", "vol_mult", "close_strength_%"]], use_container_width=True)
+
+            st.divider()
+            st.markdown("#### 2. Actionable Intraday Watchlist for Tomorrow (9:15 AM - 3:15 PM)")
+            actionable = df_intra[~df_intra["intraday_setup"].isin(["NONE", "INSUFFICIENT_DATA"])]
+            if not actionable.empty:
+                st.dataframe(actionable[["symbol", "segment", "intraday_setup", "close", "day_pct", "vol_mult", "execution_plan", "tomorrow_pivot", "tomorrow_R1", "tomorrow_S1"]], use_container_width=True)
+            else:
+                st.info("No stocks met the strict Intraday Momentum Continuation or NR7 criteria today.")
+
+            with st.expander("View Full Intraday Metrics & Tomorrow's Pivot Table"):
+                st.dataframe(df_intra, use_container_width=True)
+else:
+    st.info("👈 Authenticate in the sidebar, review your watchlist, and click **Run Both EOD Scanners**.")
