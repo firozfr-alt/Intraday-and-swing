@@ -1,7 +1,7 @@
 """
 Streamlit dashboard for two independent EOD strategies powered by live Upstox data:
   1. Strategy 1 (Swing): Weekly Breakout + EMA20 (BUY all stocks, SHORT F&O stocks only)
-  2. Strategy 2 (Next-Day Intraday): Top Gainers/Losers Continuation, NR7 & Floor Pivots
+  2. Strategy 2 (Next-Day Intraday): Top Gainers/Losers Continuation, NR7/CPR & Floor Pivots
      (Eligible for both CASH via MIS and F&O contracts).
 
 Run locally with:  streamlit run app.py
@@ -209,6 +209,15 @@ with st.sidebar:
         disabled=(universe_mode != "Custom Symbol List"),
     )
 
+    risk_per_trade = st.number_input(
+        "Intraday Risk per Trade (₹)",
+        min_value=250,
+        max_value=100000,
+        value=1500,
+        step=250,
+        help="Used to auto-calculate exact share quantity (`suggested_qty`) based on the stop-loss distance.",
+    )
+
     bear_mode = st.checkbox(
         "Downtrend Market Mode (Relax 200-DMA for Swing Buys)",
         value=True,
@@ -255,6 +264,7 @@ if run_scan:
     total = len(symbols)
 
     sig_params = inspect.signature(strategy.latest_signal).parameters
+    intra_params = inspect.signature(intraday_strategy.scan_for_tomorrow_intraday).parameters
 
     for i, sym in enumerate(symbols):
         status_text.text(f"Scanning [{i + 1}/{total}]: {sym}...")
@@ -279,8 +289,13 @@ if run_scan:
                 s_sig.setdefault("segment", "F&O" if info["is_fno"] else "CASH ONLY")
                 swing_rows.append(s_sig)
 
-                # Strategy 2: Next-Day Intraday (Both Cash MIS & F&O with liquidity checks)
-                i_sig = intraday_strategy.scan_for_tomorrow_intraday(candles, is_fno=info["is_fno"])
+                # Strategy 2: Next-Day Intraday (Both Cash MIS & F&O with liquidity & CPR checks)
+                if "risk_per_trade" in intra_params:
+                    i_sig = intraday_strategy.scan_for_tomorrow_intraday(
+                        candles, is_fno=info["is_fno"], risk_per_trade=float(risk_per_trade)
+                    )
+                else:
+                    i_sig = intraday_strategy.scan_for_tomorrow_intraday(candles, is_fno=info["is_fno"])
                 i_sig["symbol"] = sym
                 intraday_rows.append(i_sig)
 
@@ -347,39 +362,57 @@ if run_scan:
     # ================= TAB 2: NEXT-DAY INTRADAY =================
     with tab_intraday:
         st.subheader("Tomorrow's Intraday Watchlist (Cash MIS & F&O)")
-        st.caption("Identifies strong Gainers, heavy Losers (tradable via MIS in Cash or Short in F&O), and NR7 coiled setups with pre-calculated Floor Pivots.")
+        st.caption(
+            "Upgraded Engine: EMA20 Trend Alignment + ATR Exhaustion Filter + NR7/Tight CPR + PDH/PDL + Pre-Calculated Floor Pivots & Auto Position Sizing."
+        )
 
         valid_intra = df_intra[pd.notna(df_intra.get("day_pct"))].copy() if not df_intra.empty and "day_pct" in df_intra.columns else pd.DataFrame()
 
         if not valid_intra.empty:
-            st.markdown("#### 1. Today's Top Market Movers (Context)")
-            g_col, l_col = st.columns(2)
-            mover_cols = [c for c in ["symbol", "segment", "close", "day_pct", "vol_mult", "close_strength_%"] if c in valid_intra.columns]
-
-            with g_col:
-                st.markdown("**🔥 Top 10 Gainers Today**")
-                st.dataframe(valid_intra.sort_values("day_pct", ascending=False).head(10)[mover_cols], use_container_width=True, hide_index=True)
-
-            with l_col:
-                st.markdown("**❄️ Top 10 Losers Today**")
-                st.dataframe(valid_intra.sort_values("day_pct", ascending=True).head(10)[mover_cols], use_container_width=True, hide_index=True)
-
-            st.divider()
-            st.markdown("#### 2. Actionable Intraday Setups for Tomorrow (9:15 AM – 3:15 PM)")
-            actionable_intra = valid_intra[~valid_intra["intraday_setup"].isin(["NONE", "INSUFFICIENT_DATA", "SYMBOL_NOT_FOUND"])]
+            st.markdown("#### 1. Actionable Intraday Setups for Tomorrow (9:15 AM – 3:15 PM)")
+            actionable_intra = valid_intra[
+                ~valid_intra["intraday_setup"].isin(["NONE", "INSUFFICIENT_DATA", "SYMBOL_NOT_FOUND"])
+                & ~valid_intra["intraday_setup"].astype(str).str.startswith("ERROR")
+            ].sort_values(by=["vol_mult", "cpr_width_%"], ascending=[False, True])
 
             if not actionable_intra.empty:
                 plan_cols = [
                     c for c in [
                         "symbol", "segment", "intraday_setup", "close", "day_pct",
-                        "vol_mult", "nr7_day", "execution_plan",
-                        "tomorrow_pivot", "tomorrow_R1", "tomorrow_S1", "atr_14"
+                        "vol_mult", "close_strength_%", "atr_ratio", "cpr_width_%",
+                        "nr7_day", "suggested_qty", "execution_plan",
+                        "PDH", "PDL", "tomorrow_pivot", "tomorrow_TC", "tomorrow_BC",
+                        "tomorrow_R1", "tomorrow_R2", "tomorrow_S1", "tomorrow_S2", "atr_14"
                     ]
                     if c in actionable_intra.columns
                 ]
                 st.dataframe(actionable_intra[plan_cols], use_container_width=True, hide_index=True)
             else:
-                st.info("No stocks met the strict Intraday Momentum Continuation or NR7 criteria today.")
+                st.info("No stocks met the strict Intraday Momentum Continuation or NR7/CPR criteria today.")
+
+            st.divider()
+            st.markdown("#### 2. Today's Top Market Movers (Context)")
+            g_col, l_col = st.columns(2)
+            mover_cols = [
+                c for c in ["symbol", "segment", "close", "day_pct", "vol_mult", "close_strength_%", "atr_ratio", "cpr_width_%"]
+                if c in valid_intra.columns
+            ]
+
+            with g_col:
+                st.markdown("**🔥 Top Gainers Today (`day_pct > 0%`)**")
+                true_gainers = valid_intra[valid_intra["day_pct"] > 0].sort_values("day_pct", ascending=False).head(10)
+                if not true_gainers.empty:
+                    st.dataframe(true_gainers[mover_cols], use_container_width=True, hide_index=True)
+                else:
+                    st.write("No positive gainers in the scanned universe today.")
+
+            with l_col:
+                st.markdown("**❄️ Top Losers Today (`day_pct < 0%`)**")
+                true_losers = valid_intra[valid_intra["day_pct"] < 0].sort_values("day_pct", ascending=True).head(10)
+                if not true_losers.empty:
+                    st.dataframe(true_losers[mover_cols], use_container_width=True, hide_index=True)
+                else:
+                    st.write("No negative losers in the scanned universe today.")
 
             st.download_button(
                 label="📥 Download Intraday Watchlist & Pivots CSV",
