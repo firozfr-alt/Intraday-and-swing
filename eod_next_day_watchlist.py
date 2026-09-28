@@ -88,6 +88,7 @@ def main():
     parser.add_argument("--symbols", type=str, default="", help="Comma-separated NSE trading symbols")
     parser.add_argument("--all-fno", action="store_true", help="Scan all NSE F&O stocks automatically")
     parser.add_argument("--bear-mode", action="store_true", default=True, help="Relax 200-DMA filter for Swing Buys")
+    parser.add_argument("--risk", type=float, default=1500.0, help="Rupee risk per intraday trade (default: 1500)")
     parser.add_argument("--out-dir", type=str, default="output", help="Folder to save EOD CSV watchlists")
     args = parser.parse_args()
 
@@ -106,7 +107,7 @@ def main():
     intraday_results = []
     total = len(symbols)
 
-    print(f"Scanning {total} symbols (Bear Mode: {args.bear_mode})...\n")
+    print(f"Scanning {total} symbols (Bear Mode: {args.bear_mode} | Intraday Risk: Rs.{args.risk:,.0f})...\n")
 
     for idx, sym in enumerate(symbols, start=1):
         info = instruments.get_instrument_info(sym, master)
@@ -125,8 +126,10 @@ def main():
             s_sig["symbol"] = sym
             swing_results.append(s_sig)
 
-            # Strategy 2: Next-Day Intraday (Top Gainers/Losers + NR7 + Floor Pivots)
-            i_sig = intraday_strategy.scan_for_tomorrow_intraday(candles, is_fno=info["is_fno"])
+            # Strategy 2: Next-Day Intraday (Momentum + NR7/CPR + Floor Pivots)
+            i_sig = intraday_strategy.scan_for_tomorrow_intraday(
+                candles, is_fno=info["is_fno"], risk_per_trade=args.risk
+            )
             i_sig["symbol"] = sym
             intraday_results.append(i_sig)
 
@@ -170,22 +173,33 @@ def main():
     print(f"⚡ STRATEGY 2: TOMORROW'S INTRADAY WATCHLIST & TOP MOVERS ({today_str})")
     print("=" * 80)
     if not df_intra.empty and "day_pct" in df_intra.columns:
-        print("\n--- 🔥 Today's Top 5 Gainers ---")
-        gainers = df_intra.sort_values("day_pct", ascending=False).head(5)
-        print(gainers[["symbol", "segment", "close", "day_pct", "vol_mult", "close_strength_%"]].to_string(index=False))
+        valid_intra = df_intra[pd.notna(df_intra["day_pct"])].copy()
 
-        print("\n--- ❄️ Today's Top 5 Losers ---")
-        losers = df_intra.sort_values("day_pct", ascending=True).head(5)
-        print(losers[["symbol", "segment", "close", "day_pct", "vol_mult", "close_strength_%"]].to_string(index=False))
+        print("\n--- 🔥 Today's Top 5 Gainers (day_pct > 0%) ---")
+        gainers = valid_intra[valid_intra["day_pct"] > 0].sort_values("day_pct", ascending=False).head(5)
+        if not gainers.empty:
+            print(gainers[["symbol", "segment", "close", "day_pct", "vol_mult", "close_strength_%", "atr_ratio"]].to_string(index=False))
+        else:
+            print("No positive gainers today.")
 
-        print("\n--- 🎯 Actionable Intraday Setups for Tomorrow (9:15 AM ORB / Pivots) ---")
-        actionable_intra = df_intra[~df_intra["intraday_setup"].isin(["NONE", "INSUFFICIENT_DATA"])]
-        intra_cols = ["symbol", "segment", "intraday_setup", "close", "day_pct", "vol_mult", "execution_plan"]
+        print("\n--- ❄️ Today's Top 5 Losers (day_pct < 0%) ---")
+        losers = valid_intra[valid_intra["day_pct"] < 0].sort_values("day_pct", ascending=True).head(5)
+        if not losers.empty:
+            print(losers[["symbol", "segment", "close", "day_pct", "vol_mult", "close_strength_%", "atr_ratio"]].to_string(index=False))
+        else:
+            print("No negative losers today.")
+
+        print("\n--- 🎯 Actionable Intraday Setups for Tomorrow (9:15 AM ORB / CPR / Pivots) ---")
+        actionable_intra = valid_intra[~valid_intra["intraday_setup"].isin(["NONE", "INSUFFICIENT_DATA"])]
+        intra_cols = [
+            "symbol", "segment", "intraday_setup", "close", "day_pct",
+            "vol_mult", "cpr_width_%", "suggested_qty", "execution_plan"
+        ]
         intra_cols = [c for c in intra_cols if c in actionable_intra.columns]
         if not actionable_intra.empty:
             print(actionable_intra[intra_cols].to_string(index=False))
         else:
-            print("No stocks met the strict Intraday Continuation or NR7 criteria today.")
+            print("No stocks met the strict Intraday Continuation or NR7/CPR criteria today.")
 
         intra_csv = os.path.join(args.out_dir, f"intraday_watchlist_{today_str}.csv")
         df_intra.to_csv(intra_csv, index=False)
